@@ -1,0 +1,11 @@
+.DS_Store
+build/
+dist/
+.build/
+*.app/
+*.dSYM/
+previous-defaults.json
+configure-defaults
+work/
+.env
+.env.*

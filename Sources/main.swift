@@ -1,0 +1,414 @@
+import AppKit
+import PDFKit
+import UniformTypeIdentifiers
+
+enum ViewerError: LocalizedError {
+    case unreadable(String)
+    var errorDescription: String? {
+        switch self { case .unreadable(let name): return "Couldn’t open \(name). Choose a readable PDF or image." }
+    }
+}
+
+// Each open request owns a new window. Never consult the system tab preference.
+final class FileWindow: NSWindow {
+    override func mergeAllWindows(_ sender: Any?) {}
+    override func toggleTabBar(_ sender: Any?) {}
+}
+
+final class DropSurface: NSView {
+    var onOpen: (([URL]) -> Void)?
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        registerForDraggedTypes([.fileURL])
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) ? .copy : []
+    }
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty else { return false }
+        onOpen?(urls)
+        return true
+    }
+}
+
+final class ImageCanvas: NSView {
+    let image: NSImage
+    init(image: NSImage) { self.image = image; super.init(frame: .zero) }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.windowBackgroundColor.setFill()
+        bounds.fill()
+        image.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1,
+                   respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high])
+    }
+}
+
+final class CenteredClipView: NSClipView {
+    override func constrainBoundsRect(_ proposedBounds: NSRect) -> NSRect {
+        var result = super.constrainBoundsRect(proposedBounds)
+        if let documentView {
+            if documentView.frame.width < result.width { result.origin.x = (documentView.frame.width - result.width) / 2 }
+            if documentView.frame.height < result.height { result.origin.y = (documentView.frame.height - result.height) / 2 }
+        }
+        return result
+    }
+}
+
+final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDelegate {
+    let fileURL: URL
+    var pdfView: PDFView?
+    var imageScroll: NSScrollView?
+    var imageCanvas: ImageCanvas?
+    var thumbnailView: PDFThumbnailView?
+    var splitView: NSSplitView?
+    var originalImageSize = NSSize.zero
+    var imageScale: CGFloat = 1
+    var fitsImage = true
+    let status = NSTextField(labelWithString: "")
+    var onClose: (() -> Void)?
+    private var observations: [NSObjectProtocol] = []
+
+    init(url: URL) throws {
+        fileURL = url
+        guard url.isFileURL, FileManager.default.isReadableFile(atPath: url.path) else {
+            throw ViewerError.unreadable(url.lastPathComponent)
+        }
+        let isPDF = (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType?.conforms(to: .pdf)) == true || url.pathExtension.lowercased() == "pdf"
+        let pdf = isPDF ? PDFDocument(url: url) : nil
+        let image = isPDF ? nil : NSImage(contentsOf: url)
+        guard (pdf?.pageCount ?? 0) > 0 || pdf?.isLocked == true || (image?.isValid == true) else {
+            throw ViewerError.unreadable(url.lastPathComponent)
+        }
+        let window = FileWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 740),
+                                styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.tabbingMode = .disallowed
+        window.tabbingIdentifier = UUID().uuidString
+        window.isRestorable = false
+        window.isReleasedWhenClosed = false
+        window.title = url.lastPathComponent
+        window.representedURL = url
+        window.minSize = NSSize(width: 480, height: 360)
+        super.init(window: window)
+        window.delegate = self
+
+        let root = DropSurface(frame: window.contentView!.bounds)
+        root.onOpen = { urls in (NSApp.delegate as? AppDelegate)?.openURLs(urls) }
+        window.contentView = root
+        let content: NSView
+        if let pdf {
+            let view = PDFView()
+            view.document = pdf
+            view.displayMode = .singlePageContinuous
+            view.displayDirection = .vertical
+            view.autoScales = true
+            view.backgroundColor = .underPageBackgroundColor
+            view.minScaleFactor = 0.1
+            view.maxScaleFactor = 8
+            pdfView = view
+            let thumbnails = PDFThumbnailView()
+            thumbnails.pdfView = view
+            thumbnails.thumbnailSize = NSSize(width: 88, height: 120)
+            thumbnailView = thumbnails
+            let split = NSSplitView()
+            split.isVertical = true
+            split.dividerStyle = .thin
+            split.addArrangedSubview(thumbnails)
+            split.addArrangedSubview(view)
+            splitView = split
+            content = split
+            for name in [Notification.Name.PDFViewPageChanged, .PDFViewScaleChanged, .PDFDocumentDidUnlock] {
+                observations.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.updateStatus() })
+            }
+        } else if let image {
+            let representation = image.representations.max { $0.pixelsWide < $1.pixelsWide }
+            originalImageSize = NSSize(width: max(1, representation?.pixelsWide ?? Int(image.size.width)), height: max(1, representation?.pixelsHigh ?? Int(image.size.height)))
+            let canvas = ImageCanvas(image: image)
+            imageCanvas = canvas
+            let scroll = NSScrollView()
+            scroll.contentView = CenteredClipView()
+            scroll.hasVerticalScroller = true
+            scroll.hasHorizontalScroller = true
+            scroll.autohidesScrollers = true
+            scroll.backgroundColor = .underPageBackgroundColor
+            scroll.documentView = canvas
+            imageScroll = scroll
+            content = scroll
+        } else { fatalError("Unreachable: validated content") }
+        content.translatesAutoresizingMaskIntoConstraints = false
+        status.translatesAutoresizingMaskIntoConstraints = false
+        status.font = .systemFont(ofSize: 11)
+        status.textColor = .secondaryLabelColor
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        root.addSubview(content)
+        root.addSubview(status)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: root.topAnchor),
+            content.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            content.bottomAnchor.constraint(equalTo: status.topAnchor, constant: -7),
+            status.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
+            status.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
+            status.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -7),
+            status.heightAnchor.constraint(equalToConstant: 15)
+        ])
+        let toolbar = NSToolbar(identifier: "SeparateViewerToolbar")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        window.toolbar = toolbar
+        root.layoutSubtreeIfNeeded()
+        splitView?.setPosition(124, ofDividerAt: 0)
+        fit(nil)
+        updateStatus()
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    deinit { observations.forEach(NotificationCenter.default.removeObserver) }
+
+    func windowWillClose(_ notification: Notification) { onClose?() }
+    func windowDidResize(_ notification: Notification) { if fitsImage { fit(nil) } }
+
+    @objc func zoomIn(_ sender: Any?) {
+        if let pdfView { pdfView.autoScales = false; pdfView.zoomIn(sender) }
+        else { setImageScale(imageScale * 1.25) }
+        updateStatus()
+    }
+    @objc func zoomOut(_ sender: Any?) {
+        if let pdfView { pdfView.autoScales = false; pdfView.zoomOut(sender) }
+        else { setImageScale(imageScale / 1.25) }
+        updateStatus()
+    }
+    @objc func fit(_ sender: Any?) {
+        if let pdfView { pdfView.autoScales = true }
+        if let scroll = imageScroll {
+            let size = scroll.contentSize
+            setImageScale(min(size.width / originalImageSize.width, size.height / originalImageSize.height, 1))
+            fitsImage = true
+        }
+        updateStatus()
+    }
+    @objc func actualSize(_ sender: Any?) {
+        if let pdfView { pdfView.autoScales = false; pdfView.scaleFactor = 1 }
+        else { setImageScale(1) }
+        updateStatus()
+    }
+    func setImageScale(_ scale: CGFloat) {
+        fitsImage = false
+        imageScale = min(max(scale, 0.01), 16)
+        imageCanvas?.setFrameSize(NSSize(width: originalImageSize.width * imageScale, height: originalImageSize.height * imageScale))
+        imageCanvas?.needsDisplay = true
+        updateStatus()
+    }
+    @objc func previousPage(_ sender: Any?) { pdfView?.goToPreviousPage(sender) }
+    @objc func nextPage(_ sender: Any?) { pdfView?.goToNextPage(sender) }
+    @objc func toggleSidebar(_ sender: Any?) {
+        guard let thumbnails = thumbnailView, let split = splitView else { return }
+        thumbnails.isHidden.toggle()
+        split.adjustSubviews()
+        if !thumbnails.isHidden { split.setPosition(124, ofDividerAt: 0) }
+    }
+    func updateStatus() {
+        if let pdfView, let document = pdfView.document {
+            if document.isLocked { status.stringValue = "Password-protected PDF"; return }
+            let page = pdfView.currentPage.map { document.index(for: $0) + 1 } ?? 1
+            status.stringValue = "Page \(page) of \(document.pageCount)  ·  \(Int(pdfView.scaleFactor * 100))%"
+        } else {
+            status.stringValue = "\(Int(originalImageSize.width)) × \(Int(originalImageSize.height)) pixels  ·  \(Int(imageScale * 100))%"
+        }
+    }
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { toolbarDefaultItemIdentifiers(toolbar) }
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        let names = pdfView == nil ? ["open", "space", "minus", "fit", "actual", "plus"] : ["open", "sidebar", "space", "previous", "next", "minus", "fit", "actual", "plus"]
+        return names.map { $0 == "space" ? .flexibleSpace : NSToolbarItem.Identifier($0) }
+    }
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        let item = NSToolbarItem(itemIdentifier: id)
+        let configuration: (String, String, Selector)
+        switch id.rawValue {
+        case "open": configuration = ("Open files", "folder", #selector(AppDelegate.openPanel(_:)))
+        case "sidebar": configuration = ("Show or hide thumbnails", "sidebar.left", #selector(toggleSidebar(_:)))
+        case "previous": configuration = ("Previous page", "chevron.up", #selector(previousPage(_:)))
+        case "next": configuration = ("Next page", "chevron.down", #selector(nextPage(_:)))
+        case "minus": configuration = ("Zoom out", "minus.magnifyingglass", #selector(zoomOut(_:)))
+        case "plus": configuration = ("Zoom in", "plus.magnifyingglass", #selector(zoomIn(_:)))
+        case "fit": configuration = ("Fit to window", "arrow.up.left.and.arrow.down.right", #selector(fit(_:)))
+        case "actual": configuration = ("Actual size", "1.magnifyingglass", #selector(actualSize(_:)))
+        default: return nil
+        }
+        item.label = configuration.0
+        item.toolTip = configuration.0
+        item.image = NSImage(systemSymbolName: configuration.1, accessibilityDescription: configuration.0)
+        item.target = id.rawValue == "open" ? NSApp.delegate : self
+        item.action = configuration.2
+        return item
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var viewers: [UUID: ViewerController] = [:]
+    var welcome: NSWindow?
+    var cascadePoint = NSPoint(x: 130, y: 850)
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
+        makeMenu()
+        if viewers.isEmpty { showWelcome() }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    func application(_ application: NSApplication, open urls: [URL]) { openURLs(urls) }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { showWelcome() }
+        return true
+    }
+    func openURLs(_ urls: [URL]) {
+        var errors: [String] = []
+        for url in urls {
+            do {
+                let controller = try ViewerController(url: url)
+                let id = UUID()
+                viewers[id] = controller
+                controller.onClose = { [weak self] in self?.viewers.removeValue(forKey: id) }
+                if let window = controller.window {
+                    cascadePoint = window.cascadeTopLeft(from: cascadePoint)
+                    controller.showWindow(nil)
+                    window.makeKeyAndOrderFront(nil)
+                }
+                welcome?.orderOut(nil)
+            } catch { errors.append(error.localizedDescription) }
+        }
+        if !errors.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = "Some files couldn’t be opened"
+            alert.informativeText = errors.prefix(5).joined(separator: "\n")
+            alert.runModal()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    @objc func openPanel(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.pdf, .image]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.message = "Each file opens in its own window."
+        if panel.runModal() == .OK { openURLs(panel.urls) }
+    }
+    func showWelcome() {
+        if let welcome { welcome.makeKeyAndOrderFront(nil); return }
+        let window = FileWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 390), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        window.title = "Separate"
+        window.tabbingMode = .disallowed
+        window.isReleasedWhenClosed = false
+        window.center()
+        let root = DropSurface(frame: window.contentView!.bounds)
+        root.onOpen = { [weak self] urls in self?.openURLs(urls) }
+        window.contentView = root
+        let iconImage = NSImage(named: "AppIcon") ?? NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Separate windows")!
+        let icon = NSImageView(image: iconImage)
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.setAccessibilityLabel("Separate app icon")
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 96).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 96).isActive = true
+        let heading = NSTextField(labelWithString: "One file. One window.")
+        heading.font = .systemFont(ofSize: 26, weight: .semibold)
+        let detail = NSTextField(labelWithString: "Drop PDFs or images here to get started.")
+        detail.textColor = .secondaryLabelColor
+        let button = NSButton(title: "Open Files…", target: self, action: #selector(openPanel(_:)))
+        button.bezelStyle = .rounded
+        button.keyEquivalent = "\r"
+        let stack = NSStackView(views: [icon, heading, detail, button])
+        stack.orientation = .vertical
+        stack.spacing = 18
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([stack.centerXAnchor.constraint(equalTo: root.centerXAnchor), stack.centerYAnchor.constraint(equalTo: root.centerYAnchor)])
+        welcome = window
+        window.makeKeyAndOrderFront(nil)
+    }
+    func makeMenu() {
+        let menu = NSMenu()
+        func submenu(_ title: String) -> NSMenu {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            let child = NSMenu(title: title)
+            item.submenu = child
+            menu.addItem(item)
+            return child
+        }
+        let appMenu = submenu("Separate")
+        appMenu.addItem(withTitle: "About Separate", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide Separate", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Quit Separate", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let file = submenu("File")
+        let open = file.addItem(withTitle: "Open…", action: #selector(openPanel(_:)), keyEquivalent: "o")
+        open.target = self
+        file.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        let edit = submenu("Edit")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let view = submenu("View")
+        view.addItem(withTitle: "Zoom In", action: #selector(ViewerController.zoomIn(_:)), keyEquivalent: "+")
+        view.addItem(withTitle: "Zoom Out", action: #selector(ViewerController.zoomOut(_:)), keyEquivalent: "-")
+        view.addItem(withTitle: "Fit to Window", action: #selector(ViewerController.fit(_:)), keyEquivalent: "0")
+        view.addItem(withTitle: "Actual Size", action: #selector(ViewerController.actualSize(_:)), keyEquivalent: "1")
+        view.addItem(withTitle: "Show or Hide Thumbnails", action: #selector(ViewerController.toggleSidebar(_:)), keyEquivalent: "")
+        view.addItem(withTitle: "Previous Page", action: #selector(ViewerController.previousPage(_:)), keyEquivalent: "")
+        view.addItem(withTitle: "Next Page", action: #selector(ViewerController.nextPage(_:)), keyEquivalent: "")
+        let windows = submenu("Window")
+        windows.addItem(withTitle: "Minimise", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windows.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        NSApp.windowsMenu = windows
+        NSApp.mainMenu = menu
+    }
+}
+
+func selfTest(_ directory: String) throws {
+    NSWindow.allowsAutomaticWindowTabbing = false
+    let base = URL(fileURLWithPath: directory)
+    let names = ["window-one.pdf", "window-two.pdf", "image-one.png", "image-two.png"]
+    var controllers: [ViewerController] = []
+    for index in 0..<24 {
+        let controller = try ViewerController(url: base.appendingPathComponent(names[index % names.count]))
+        controllers.append(controller)
+        precondition(controller.window?.tabbingMode == .disallowed)
+        precondition(controller.window?.tabbedWindows == nil || controller.window?.tabbedWindows?.count == 1)
+        precondition((controller.pdfView?.document?.pageCount ?? 0) > 0 || controller.imageCanvas != nil)
+        if controller.imageCanvas != nil {
+            controller.actualSize(nil)
+            precondition(controller.imageScale == 1)
+            controller.zoomIn(nil)
+            precondition(controller.imageScale > 1)
+            controller.fit(nil)
+            precondition(controller.fitsImage)
+        } else {
+            controller.actualSize(nil)
+            precondition(abs(controller.pdfView!.scaleFactor - 1) < 0.01)
+            controller.nextPage(nil)
+            precondition(controller.pdfView?.currentPage == controller.pdfView?.document?.page(at: 1))
+        }
+    }
+    precondition(Set(controllers.map { ObjectIdentifier($0.window!) }).count == 24)
+    precondition(Set(controllers.compactMap { $0.window?.tabbingIdentifier }).count == 24)
+    precondition(!NSWindow.allowsAutomaticWindowTabbing)
+    do {
+        _ = try ViewerController(url: base.appendingPathComponent("missing.pdf"))
+        fatalError("Missing file must fail")
+    } catch is ViewerError {}
+    do {
+        _ = try ViewerController(url: base.appendingPathComponent("invalid.pdf"))
+        fatalError("Invalid file must fail")
+    } catch is ViewerError {}
+    controllers.forEach { $0.close() }
+    print("PASS: 24 independent PDF/image windows, tabs disabled, duplicate opens independent, zoom/fit/page navigation, invalid and missing file handling.")
+}
+
+let application = NSApplication.shared
+NSWindow.allowsAutomaticWindowTabbing = false
+if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--self-test" {
+    do { try selfTest(CommandLine.arguments[2]); exit(0) }
+    catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
+}
+let delegate = AppDelegate()
+application.delegate = delegate
+application.setActivationPolicy(.regular)
+application.run()
