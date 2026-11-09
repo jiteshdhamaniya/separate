@@ -5,12 +5,21 @@
 <h1 align="center">Separate</h1>
 <p align="center"><strong>One file. One window.</strong><br>A small native macOS viewer for PDFs and images.</p>
 <p align="center">
-  <a href="https://github.com/jiteshdhamaniya/separate/releases/latest">Download</a> ·
   <a href="#build-from-source">Build from source</a> ·
   <a href="LICENSE">MIT License</a>
 </p>
 
 Separate is for people who want documents in their own windows. Open one file or a whole batch: each gets a fresh window. Reopening the same file creates another independent window. Automatic tabs are disabled in the app and on every window, regardless of your macOS tab preference.
+
+## Why I built Separate
+
+I was frustrated with Preview opening PDFs and images in tabs or grouping multiple images into one window. What I wanted was simple: every file I open should get its own window. That included PDFs, images, opening a batch of files, and opening the same file again.
+
+We tried Preview and macOS window settings, but the grouping behavior still showed up in my workflow. Eventually I thought: if this is the behavior I want, why not make a small viewer that does it by default? That became Separate: **one file, one window**.
+
+I used LLMs to help write the app. It started with that one windowing rule, then gained the everyday features I wanted while using it: pinch-to-zoom, two-finger double-tap zoom, and selecting and copying text from images with Apple's Live Text.
+
+This is a small, opinionated viewer, with a narrower feature set than Preview. I'm sharing the source so you can inspect it, change it, and build your own copy. **I recommend building it yourself using the instructions below.**
 
 ## Features
 
@@ -23,21 +32,67 @@ Separate is for people who want documents in their own windows. Open one file or
 - Native AppKit interface with PDFKit rendering. No web wrapper, account, telemetry or third-party packages.
 - Files are opened for viewing; Separate does not save changes to your originals.
 
-## Install
+## Build from source
 
-**Build from source for the latest features**, including gestures and Live Text; see [Build from source](#build-from-source). Copy `build/Separate.app` into Applications after building. A paid Apple Developer membership is not needed to build and run it locally.
+### 1. Install Apple's developer tools
 
-The archived 0.1.0 binary below predates gesture zoom and Live Text.
+You need a Mac running **macOS 13 or later** and a recent version of Apple's Xcode Command Line Tools (or full Xcode). The build produces one universal app for Apple Silicon and Intel. Development and local testing used Swift 6.2 on Apple Silicon; the macOS 13 minimum and Intel runtime have not been independently tested.
 
-Requires **macOS 13 or later**. The release ZIP contains a universal app for Apple Silicon and Intel.
+Open **Terminal** and run:
 
-1. Download `Separate-0.1.0-macos-universal.zip` from [Releases](https://github.com/jiteshdhamaniya/separate/releases/latest).
-2. Unzip it and drag **Separate.app** into **Applications**.
-3. Launch Separate and choose **Open Files…**, or use Finder → **Open With → Separate**.
+```sh
+xcode-select --install
+```
 
-The initial release is **ad-hoc signed, not Developer ID signed or notarized by Apple**. macOS may block a downloaded copy. Review the source or build it yourself; if you choose to trust the downloaded app, follow [Apple’s per-app opening instructions](https://support.apple.com/102445). Do not disable Gatekeeper globally.
+Finish the installer before continuing. If the tools are already installed, you can skip this step. See [Apple's installation guide](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools) if you need to install or update them.
 
-SHA-256 checksums are included with each release. Compare the ZIP using `shasum -a 256 Separate-0.1.0-macos-universal.zip`.
+Check that Terminal can find Swift:
+
+```sh
+xcrun swiftc --version
+```
+
+### 2. Get the source
+
+Run these commands from the folder where you want to keep the project:
+
+```sh
+git clone https://github.com/jiteshdhamaniya/separate.git
+cd separate
+```
+
+You can inspect the app in `Sources/main.swift` and the build steps in `scripts/build.sh` before running them. There are no third-party packages to install, API keys, or cloud accounts to configure.
+
+### 3. Build and test
+
+From the `separate` folder, run:
+
+```sh
+bash scripts/build.sh
+bash scripts/test.sh
+```
+
+The first command creates **`build/Separate.app`**. It compiles both architectures, creates the app icon, and signs the result with a local ad-hoc signature. **You do not need a paid Apple Developer membership or a signing certificate to build and run your own copy.** This does not produce an Apple-notarized app for distribution.
+
+The tests use generated PDFs and images, including an image containing text. Run them from Terminal while logged in to your Mac's desktop; AppKit tests need a graphical session. Look for `PASS` messages and a successful exit. Live Text checks explicitly report a skip on unsupported devices.
+
+### 4. Open and install
+
+Launch your freshly built app:
+
+```sh
+open build/Separate.app
+```
+
+Choose **Open Files…**, or drag PDFs and images onto the app. Each file opens in its own window.
+
+To keep it in Applications, quit Separate, run the following command, then drag **Separate.app** from that Finder window into **Applications**:
+
+```sh
+open build
+```
+
+Open the installed copy from Applications. Building or installing does not automatically change your default apps.
 
 ### Make Separate the default
 
@@ -52,29 +107,39 @@ In Finder, select a PDF or image → **Get Info** → **Open with: Separate** �
 | Fit to window | ⌘0 |
 | Actual size | ⌘1 |
 | Zoom in / out | ⌘+ / ⌘− |
-| Copy selected PDF text | ⌘C |
+| Copy selected PDF or recognized image text | ⌘C |
 | Quit | ⌘Q |
 
 For two-finger double tap, enable **Smart zoom** in macOS System Settings → Trackpad → Scroll & Zoom. Live Text starts recognizing images when they open; the status bar shows when text is ready to select. Recognition quality depends on the image and language. If recognition is unavailable or no text is found, image viewing and zoom still work. This feature recognizes text in image files; it does not add OCR to scanned PDF pages.
 
-## Scope of this first release
+## Current scope
 
 Separate is a viewer. It does not yet provide annotations, signatures, image editing, printing/export, search, or session restoration. For those tasks, use **Open With → Preview** or another editor. Animated and multipage images use the representation macOS selects; animation playback is not provided. Password-protected PDFs use PDFKit’s password UI.
 
 The universal build is compiled for both architectures. Interactive testing for this release was performed on Apple Silicon running macOS 26.1; Intel and macOS 13 runtime behavior have not been independently verified.
 
-## Build from source
+## Update your local build
 
-Install Apple’s Xcode Command Line Tools, then:
+Quit Separate, open Terminal in your existing `separate` checkout, and run:
 
 ```sh
-git clone https://github.com/jiteshdhamaniya/separate.git
-cd separate
+git pull --ff-only
 bash scripts/build.sh
-open build/Separate.app
+bash scripts/test.sh
 ```
 
-The build compiles both architectures, creates a multi-resolution `.icns` from the committed icon artwork, combines the executables, and ad-hoc signs the app. It needs no package downloads. The source uses Swift 5 language mode with a modern Swift compiler; Swift 6.2 was used for the initial local release build.
+Then copy the rebuilt `build/Separate.app` into Applications again. If Git reports conflicting local changes or a diverged branch, resolve those before updating; these commands do not discard your work.
+
+## Troubleshooting
+
+- **`xcrun` or Swift is missing:** finish installing the Command Line Tools. After a macOS upgrade, check Software Update for a compatible tools update.
+- **Compiler or SDK errors:** update the developer tools supported by your macOS version. Include `sw_vers` and `xcrun swiftc --version` output when reporting a build problem.
+- **Tests cannot connect to WindowServer:** run them from a Terminal window in a logged-in desktop session instead of a headless environment.
+- **Two-finger double tap does nothing:** enable Smart zoom under System Settings → Trackpad → Scroll & Zoom.
+
+## Archived binary release
+
+The [initial 0.1.0 release](https://github.com/jiteshdhamaniya/separate/releases/tag/v0.1.0) remains available, but predates gesture zoom and Live Text. Build the current source for the latest features. That downloaded binary is ad-hoc signed and is not notarized by Apple; macOS may block it. Apple's [per-app opening instructions](https://support.apple.com/102445) explain the system's behavior.
 
 ## Test and package
 
