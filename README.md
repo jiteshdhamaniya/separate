@@ -17,11 +17,17 @@ Separate is for people who want documents in their own windows. Open one file or
 - PDF viewing with continuous scrolling, selectable text, page thumbnails and previous/next navigation.
 - Image viewing with zoom, fit and actual size. Common formats are decoded by macOS, including PNG, JPEG, HEIC, TIFF, GIF, BMP and WebP.
 - Trackpad pinch-to-zoom for both PDFs and images, anchored at the pointer. Place the pointer over the document and pinch with two fingers to zoom in or out; use ⌘0 to return to Fit.
+- Two-finger double-tap zoom for PDFs and images: zoom in at the pointer, then double-tap again to restore the previous zoom or Fit mode.
+- Live Text in images: select recognized text directly on the image and copy it with ⌘C or the context menu. Recognition runs locally using Apple's VisionKit and does not require Apple Intelligence.
 - Open multiple files from Finder, the Open dialog, or by dragging them onto the app icon or welcome window.
 - Native AppKit interface with PDFKit rendering. No web wrapper, account, telemetry or third-party packages.
 - Files are opened for viewing; Separate does not save changes to your originals.
 
-## Download and install
+## Install
+
+**Build from source for the latest features**, including gestures and Live Text; see [Build from source](#build-from-source). Copy `build/Separate.app` into Applications after building. A paid Apple Developer membership is not needed to build and run it locally.
+
+The archived 0.1.0 binary below predates gesture zoom and Live Text.
 
 Requires **macOS 13 or later**. The release ZIP contains a universal app for Apple Silicon and Intel.
 
@@ -49,6 +55,8 @@ In Finder, select a PDF or image → **Get Info** → **Open with: Separate** �
 | Copy selected PDF text | ⌘C |
 | Quit | ⌘Q |
 
+For two-finger double tap, enable **Smart zoom** in macOS System Settings → Trackpad → Scroll & Zoom. Live Text starts recognizing images when they open; the status bar shows when text is ready to select. Recognition quality depends on the image and language. If recognition is unavailable or no text is found, image viewing and zoom still work. This feature recognizes text in image files; it does not add OCR to scanned PDF pages.
+
 ## Scope of this first release
 
 Separate is a viewer. It does not yet provide annotations, signatures, image editing, printing/export, search, or session restoration. For those tasks, use **Open With → Preview** or another editor. Animated and multipage images use the representation macOS selects; animation playback is not provided. Password-protected PDFs use PDFKit’s password UI.
@@ -75,7 +83,7 @@ bash scripts/test.sh
 bash scripts/package.sh
 ```
 
-Tests create their own synthetic PDFs and PNGs, instantiate 24 independent windows without showing them, check the no-tabs policy and repeated file opens, exercise image scaling/PDF navigation, dispatch synthetic pinch events through each window (both directions, scale limits, pointer anchoring and returning to Fit), reject invalid and missing files, and confirm the input files are unchanged. AppKit tests require a logged-in macOS graphical session. Packaging produces a universal ZIP and checksum in `dist/`.
+Tests create their own synthetic PDFs and PNGs, instantiate 24 independent windows without showing them, check the no-tabs policy and repeated file opens, exercise image scaling/PDF navigation, dispatch synthetic pinch and smart-zoom events through each window, recognize and select text in a generated image, reject invalid and missing files, and confirm the input files are unchanged. Live Text checks explicitly report a skip on unsupported devices. AppKit tests require a logged-in macOS graphical session. Packaging produces a universal ZIP and checksum in `dist/`.
 
 The original viewer was also tested interactively by opening 24 mixed PDFs and PNGs from Finder and checking that they remained separate windows.
 

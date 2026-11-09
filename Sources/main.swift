@@ -1,5 +1,6 @@
 import AppKit
 import PDFKit
+import VisionKit
 import UniformTypeIdentifiers
 
 enum ViewerError: LocalizedError {
@@ -11,11 +12,11 @@ enum ViewerError: LocalizedError {
 
 // Each open request owns a new window. Never consult the system tab preference.
 final class FileWindow: NSWindow {
-    var onMagnify: ((NSEvent) -> Bool)?
+    var onZoomGesture: ((NSEvent) -> Bool)?
     override func sendEvent(_ event: NSEvent) {
         // Route pinch events before PDFKit's nested views can consume them.
         // Returning early also prevents applying the same zoom twice.
-        if event.type == .magnify, onMagnify?(event) == true { return }
+        if (event.type == .magnify || event.type == .smartMagnify), onZoomGesture?(event) == true { return }
         super.sendEvent(event)
     }
     override func mergeAllWindows(_ sender: Any?) {}
@@ -39,15 +40,59 @@ final class DropSurface: NSView {
     }
 }
 
-final class ImageCanvas: NSView {
-    let image: NSImage
-    init(image: NSImage) { self.image = image; super.init(frame: .zero) }
+final class ImageCanvas: NSImageView {
+    let textOverlay = ImageAnalysisOverlayView(frame: .zero)
+    var onAnalysisChanged: (() -> Void)?
+    private(set) var textStatus = ""
+    private(set) var isAnalyzing = false
+    private var analysisTask: Task<Void, Never>?
+
+    init(image: NSImage) {
+        super.init(frame: .zero)
+        self.image = image
+        imageScaling = .scaleAxesIndependently
+        isEditable = false
+        allowsCutCopyPaste = false
+        textOverlay.frame = bounds
+        textOverlay.autoresizingMask = [.width, .height]
+        textOverlay.trackingImageView = self
+        textOverlay.preferredInteractionTypes = .textSelection
+        addSubview(textOverlay)
+    }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
-        bounds.fill()
-        image.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1,
-                   respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high])
+    deinit { analysisTask?.cancel() }
+
+    func analyzeText() {
+        guard analysisTask == nil, let image else { return }
+        guard ImageAnalyzer.isSupported else {
+            textStatus = "Live Text unavailable on this Mac"
+            onAnalysisChanged?()
+            return
+        }
+        isAnalyzing = true
+        textStatus = "Recognizing text…"
+        onAnalysisChanged?()
+        // Analyze the displayed image once. Resizing only updates the overlay geometry.
+        analysisTask = Task { @MainActor [weak self, image] in
+            do {
+                let analysis = try await ImageAnalyzer().analyze(image, orientation: .up, configuration: .init(.text))
+                guard !Task.isCancelled, let self else { return }
+                self.textOverlay.analysis = analysis
+                self.textStatus = analysis.hasResults(for: .text) ? "Select text to copy" : "No text found"
+                self.isAnalyzing = false
+                self.onAnalysisChanged?()
+            } catch {
+                guard !Task.isCancelled, let self else { return }
+                self.textStatus = "Text recognition unavailable"
+                self.isAnalyzing = false
+                self.onAnalysisChanged?()
+            }
+        }
+    }
+    func cancelAnalysis() {
+        analysisTask?.cancel()
+        analysisTask = nil
+        isAnalyzing = false
     }
 }
 
@@ -75,8 +120,9 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
     let status = NSTextField(labelWithString: "")
     var onClose: (() -> Void)?
     private var observations: [NSObjectProtocol] = []
+    private var smartZoomReturn: (scale: CGFloat, fits: Bool)?
 
-    init(url: URL) throws {
+    init(url: URL, analyzeImages: Bool = true) throws {
         fileURL = url
         guard url.isFileURL, FileManager.default.isReadableFile(atPath: url.path) else {
             throw ViewerError.unreadable(url.lastPathComponent)
@@ -98,7 +144,10 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
         window.minSize = NSSize(width: 480, height: 360)
         super.init(window: window)
         window.delegate = self
-        window.onMagnify = { [weak self] event in self?.magnify(with: event) ?? false }
+        window.onZoomGesture = { [weak self] event in
+            guard let self else { return false }
+            return event.type == .smartMagnify ? self.smartMagnify(with: event) : self.magnify(with: event)
+        }
 
         let root = DropSurface(frame: window.contentView!.bounds)
         root.onOpen = { urls in (NSApp.delegate as? AppDelegate)?.openURLs(urls) }
@@ -133,6 +182,7 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
             originalImageSize = NSSize(width: max(1, representation?.pixelsWide ?? Int(image.size.width)), height: max(1, representation?.pixelsHigh ?? Int(image.size.height)))
             let canvas = ImageCanvas(image: image)
             imageCanvas = canvas
+            canvas.onAnalysisChanged = { [weak self] in self?.updateStatus() }
             let scroll = NSScrollView()
             scroll.contentView = CenteredClipView()
             scroll.hasVerticalScroller = true
@@ -168,25 +218,29 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
         root.layoutSubtreeIfNeeded()
         splitView?.setPosition(124, ofDividerAt: 0)
         fit(nil)
+        if analyzeImages { imageCanvas?.analyzeText() }
         updateStatus()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit { observations.forEach(NotificationCenter.default.removeObserver) }
 
-    func windowWillClose(_ notification: Notification) { onClose?() }
+    func windowWillClose(_ notification: Notification) { imageCanvas?.cancelAnalysis(); onClose?() }
     func windowDidResize(_ notification: Notification) { if fitsImage { fit(nil) } }
 
     @objc func zoomIn(_ sender: Any?) {
+        smartZoomReturn = nil
         if let pdfView { pdfView.autoScales = false; pdfView.zoomIn(sender) }
         else { setImageScale(imageScale * 1.25) }
         updateStatus()
     }
     @objc func zoomOut(_ sender: Any?) {
+        smartZoomReturn = nil
         if let pdfView { pdfView.autoScales = false; pdfView.zoomOut(sender) }
         else { setImageScale(imageScale / 1.25) }
         updateStatus()
     }
     @objc func fit(_ sender: Any?) {
+        smartZoomReturn = nil
         if let pdfView { pdfView.autoScales = true }
         if let scroll = imageScroll {
             let size = scroll.contentSize
@@ -196,6 +250,7 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
         updateStatus()
     }
     @objc func actualSize(_ sender: Any?) {
+        smartZoomReturn = nil
         if let pdfView { pdfView.autoScales = false; pdfView.scaleFactor = 1 }
         else { setImageScale(1) }
         updateStatus()
@@ -209,28 +264,52 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
         if imageScroll != nil {
             setImageScale(imageScale * factor, anchorInWindow: event.locationInWindow)
         } else if let pdfView {
-            // Keep the point on the PDF under the pointer stationary when possible.
-            let point = pdfView.convert(event.locationInWindow, from: nil)
-            let page = pdfView.page(for: point, nearest: true)
-            let pagePoint = page.map { pdfView.convert(point, to: $0) }
-            let clip = pdfView.documentView?.enclosingScrollView?.contentView
-            let oldClipSize = clip?.bounds.size
-            let oldPoint = pdfView.documentView?.convert(event.locationInWindow, from: nil)
-            let offset = oldPoint.flatMap { p in clip.map { NSPoint(x: p.x - $0.bounds.minX, y: p.y - $0.bounds.minY) } }
-            pdfView.autoScales = false
-            pdfView.scaleFactor = min(max(pdfView.scaleFactor * factor, pdfView.minScaleFactor), pdfView.maxScaleFactor)
-            pdfView.layoutDocumentView()
-            if let page, let pagePoint, let clip, let offset, let oldClipSize,
-               oldClipSize.width > 0, oldClipSize.height > 0, let document = pdfView.documentView {
-                let newPoint = document.convert(pdfView.convert(pagePoint, from: page), from: pdfView)
-                // PDFKit also scales the clip view's coordinate system.
-                let adjustedOffset = NSPoint(x: offset.x * clip.bounds.width / oldClipSize.width,
-                                             y: offset.y * clip.bounds.height / oldClipSize.height)
-                scroll(clip, to: NSPoint(x: newPoint.x - adjustedOffset.x, y: newPoint.y - adjustedOffset.y))
-            }
-            updateStatus()
+            setPDFScale(pdfView.scaleFactor * factor, anchorInWindow: event.locationInWindow)
         }
         return true
+    }
+    func smartMagnify(with event: NSEvent) -> Bool {
+        guard let content = (imageScroll as NSView?) ?? pdfView,
+              content.bounds.contains(content.convert(event.locationInWindow, from: nil)) else { return false }
+        if let saved = smartZoomReturn {
+            if saved.fits { fit(nil) }
+            else if pdfView != nil { setPDFScale(saved.scale, anchorInWindow: event.locationInWindow) }
+            else { setImageScale(saved.scale, anchorInWindow: event.locationInWindow) }
+        } else {
+            let current = pdfView?.scaleFactor ?? imageScale
+            let maximum = pdfView?.maxScaleFactor ?? 16
+            if current >= maximum { fit(nil); return true }
+            let saved = (scale: current, fits: pdfView?.autoScales ?? fitsImage)
+            let target = min(max(current * 2, 1), maximum)
+            if pdfView != nil { setPDFScale(target, anchorInWindow: event.locationInWindow) }
+            else { setImageScale(target, anchorInWindow: event.locationInWindow) }
+            smartZoomReturn = saved
+        }
+        return true
+    }
+    private func setPDFScale(_ scale: CGFloat, anchorInWindow: NSPoint) {
+        guard scale.isFinite, let pdfView else { return }
+        smartZoomReturn = nil
+        // Keep the point on the PDF under the pointer stationary when possible.
+        let point = pdfView.convert(anchorInWindow, from: nil)
+        let page = pdfView.page(for: point, nearest: true)
+        let pagePoint = page.map { pdfView.convert(point, to: $0) }
+        let clip = pdfView.documentView?.enclosingScrollView?.contentView
+        let oldClipSize = clip?.bounds.size
+        let oldPoint = pdfView.documentView?.convert(anchorInWindow, from: nil)
+        let offset = oldPoint.flatMap { p in clip.map { NSPoint(x: p.x - $0.bounds.minX, y: p.y - $0.bounds.minY) } }
+        pdfView.autoScales = false
+        pdfView.scaleFactor = min(max(scale, pdfView.minScaleFactor), pdfView.maxScaleFactor)
+        pdfView.layoutDocumentView()
+        if let page, let pagePoint, let clip, let offset, let oldClipSize,
+           oldClipSize.width > 0, oldClipSize.height > 0, let document = pdfView.documentView {
+            let newPoint = document.convert(pdfView.convert(pagePoint, from: page), from: pdfView)
+            // PDFKit also scales the clip view's coordinate system.
+            let adjustedOffset = NSPoint(x: offset.x * clip.bounds.width / oldClipSize.width,
+                                         y: offset.y * clip.bounds.height / oldClipSize.height)
+            scroll(clip, to: NSPoint(x: newPoint.x - adjustedOffset.x, y: newPoint.y - adjustedOffset.y))
+        }
+        updateStatus()
     }
     private func scroll(_ clip: NSClipView, to origin: NSPoint) {
         let proposed = NSRect(origin: origin, size: clip.bounds.size)
@@ -239,6 +318,7 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
     }
     func setImageScale(_ scale: CGFloat, anchorInWindow: NSPoint? = nil) {
         guard scale.isFinite, let canvas = imageCanvas, let clip = imageScroll?.contentView else { return }
+        smartZoomReturn = nil
         let anchor = anchorInWindow.map { canvas.convert($0, from: nil) }
             ?? NSPoint(x: clip.bounds.midX, y: clip.bounds.midY)
         let offset = NSPoint(x: anchor.x - clip.bounds.minX, y: anchor.y - clip.bounds.minY)
@@ -248,6 +328,7 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
         canvas.setFrameSize(NSSize(width: originalImageSize.width * imageScale, height: originalImageSize.height * imageScale))
         let ratio = imageScale / previousScale
         scroll(clip, to: NSPoint(x: anchor.x * ratio - offset.x, y: anchor.y * ratio - offset.y))
+        canvas.textOverlay.setContentsRectNeedsUpdate()
         canvas.needsDisplay = true
         updateStatus()
     }
@@ -266,6 +347,7 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
             status.stringValue = "Page \(page) of \(document.pageCount)  ·  \(Int(pdfView.scaleFactor * 100))%"
         } else {
             status.stringValue = "\(Int(originalImageSize.width)) × \(Int(originalImageSize.height)) pixels  ·  \(Int(imageScale * 100))%"
+            if let textStatus = imageCanvas?.textStatus, !textStatus.isEmpty { status.stringValue += "  ·  " + textStatus }
         }
     }
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { toolbarDefaultItemIdentifiers(toolbar) }
@@ -418,7 +500,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 final class TestMagnifyEvent: NSEvent {
     var delta: CGFloat = 0
     var point = NSPoint.zero
-    override var type: NSEvent.EventType { .magnify }
+    var eventType: NSEvent.EventType = .magnify
+    override var type: NSEvent.EventType { eventType }
     override var magnification: CGFloat { delta }
     override var locationInWindow: NSPoint { point }
 }
@@ -476,13 +559,65 @@ func testPinch(_ controller: ViewerController) {
     }
 }
 
-func selfTest(_ directory: String) throws {
+func testSmartZoom(_ controller: ViewerController) {
+    let content: NSView = controller.imageScroll ?? controller.pdfView!
+    let event = TestMagnifyEvent()
+    event.eventType = .smartMagnify
+    event.point = content.convert(NSPoint(x: content.bounds.midX, y: content.bounds.midY), to: nil)
+    func scale() -> CGFloat { controller.pdfView?.scaleFactor ?? controller.imageScale }
+    controller.fit(nil)
+    let fitted = scale()
+    controller.window!.sendEvent(event)
+    precondition(scale() > fitted, "Two-finger double tap must zoom in")
+    controller.window!.sendEvent(event)
+    precondition(abs(scale() - fitted) < 0.001)
+    precondition(controller.pdfView?.autoScales ?? controller.fitsImage, "Second double tap must restore Fit")
+    controller.actualSize(nil)
+    controller.window!.sendEvent(event)
+    precondition(abs(scale() - 2) < 0.001)
+    controller.window!.sendEvent(event)
+    precondition(abs(scale() - 1) < 0.001, "Double tap must restore a custom zoom too")
+    controller.window!.sendEvent(event)
+    controller.zoomOut(nil)
+    let manuallyAdjusted = scale()
+    controller.window!.sendEvent(event)
+    precondition(scale() > manuallyAdjusted, "Manual zoom must reset the smart-zoom toggle")
+    event.point = NSPoint(x: -100, y: -100)
+    precondition(!controller.smartMagnify(with: event))
+}
+
+@MainActor func testLiveText(_ base: URL) throws {
+    guard ImageAnalyzer.isSupported else { print("SKIP: Live Text unsupported on this Mac"); return }
+    let controller = try ViewerController(url: base.appendingPathComponent("text-image.png"))
+    let canvas = controller.imageCanvas!
+    let deadline = Date().addingTimeInterval(45)
+    while canvas.isAnalyzing && Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    }
+    precondition(!canvas.isAnalyzing, "Text recognition timed out")
+    let transcript = canvas.textOverlay.analysis?.transcript ?? ""
+    precondition(transcript.contains("Separate reads this text") && transcript.contains("One file"),
+                 "Live Text must recognize the synthetic image")
+    precondition(canvas.textOverlay.preferredInteractionTypes == .textSelection)
+    controller.setImageScale(2)
+    precondition(canvas.textOverlay.frame == canvas.bounds, "Text overlay must follow image zoom")
+    if #available(macOS 14.0, *) {
+        let text = canvas.textOverlay.text
+        canvas.textOverlay.selectedRanges = [text.startIndex..<text.endIndex]
+        precondition(canvas.textOverlay.selectedText.contains("Separate reads this text"), "Recognized text must be selectable")
+    }
+    controller.close()
+    precondition(!canvas.isAnalyzing)
+    print("PASS: Live Text recognition, selectable text and overlay zoom geometry")
+}
+
+@MainActor func selfTest(_ directory: String) throws {
     NSWindow.allowsAutomaticWindowTabbing = false
     let base = URL(fileURLWithPath: directory)
     let names = ["window-one.pdf", "window-two.pdf", "image-one.png", "image-two.png"]
     var controllers: [ViewerController] = []
     for index in 0..<24 {
-        let controller = try ViewerController(url: base.appendingPathComponent(names[index % names.count]))
+        let controller = try ViewerController(url: base.appendingPathComponent(names[index % names.count]), analyzeImages: false)
         controllers.append(controller)
         precondition(controller.window?.tabbingMode == .disallowed)
         precondition(controller.window?.tabbedWindows == nil || controller.window?.tabbedWindows?.count == 1)
@@ -501,6 +636,7 @@ func selfTest(_ directory: String) throws {
             precondition(controller.pdfView?.currentPage == controller.pdfView?.document?.page(at: 1))
         }
         testPinch(controller)
+        testSmartZoom(controller)
     }
     precondition(Set(controllers.map { ObjectIdentifier($0.window!) }).count == 24)
     precondition(Set(controllers.compactMap { $0.window?.tabbingIdentifier }).count == 24)
@@ -514,13 +650,14 @@ func selfTest(_ directory: String) throws {
         fatalError("Invalid file must fail")
     } catch is ViewerError {}
     controllers.forEach { $0.close() }
+    try testLiveText(base)
     print("PASS: 24 independent PDF/image windows, tabs disabled, duplicate opens independent, pinch in/out and limits, zoom anchoring, zoom/fit/page navigation, invalid and missing file handling.")
 }
 
 let application = NSApplication.shared
 NSWindow.allowsAutomaticWindowTabbing = false
 if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--self-test" {
-    do { try selfTest(CommandLine.arguments[2]); exit(0) }
+    do { try MainActor.assumeIsolated { try selfTest(CommandLine.arguments[2]) }; exit(0) }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
 let delegate = AppDelegate()

@@ -11,7 +11,7 @@ for architecture in arm64 x86_64; do
   xcrun swiftc -swift-version 5 -O -warnings-as-errors -module-name Separate \
     -target "$architecture-apple-macosx13.0" -module-cache-path "$module_cache" \
     -file-prefix-map "$repo_root"=. -debug-prefix-map "$repo_root"=. \
-    -framework AppKit -framework PDFKit -framework UniformTypeIdentifiers \
+    -framework AppKit -framework PDFKit -framework VisionKit -framework UniformTypeIdentifiers \
     "$repo_root/Sources/main.swift" -o "$build_temp/Separate-$architecture"
 done
 xcrun lipo -create "$build_temp/Separate-arm64" "$build_temp/Separate-x86_64" \

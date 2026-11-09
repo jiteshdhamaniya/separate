@@ -3,6 +3,7 @@ import Foundation
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+import CoreText
 
 guard CommandLine.arguments.count == 2 else { fatalError("Pass an output directory") }
 let directory = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
@@ -34,5 +35,21 @@ for index in 1...2 {
     }
     pdf.closePDF()
 }
+let textBitmap = CGContext(data: nil, width: 1000, height: 400, bitsPerComponent: 8, bytesPerRow: 0,
+                           space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+textBitmap.setFillColor(CGColor(gray: 1, alpha: 1))
+textBitmap.fill(CGRect(x: 0, y: 0, width: 1000, height: 400))
+for (index, text) in ["Separate reads this text.", "One file. One window."].enumerated() {
+    let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [
+        NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName("Helvetica" as CFString, 58, nil),
+        NSAttributedString.Key(kCTForegroundColorAttributeName as String): CGColor(gray: 0, alpha: 1)
+    ]))
+    textBitmap.textPosition = CGPoint(x: 60, y: 250 - index * 110)
+    CTLineDraw(line, textBitmap)
+}
+let textDestination = CGImageDestinationCreateWithURL(directory.appendingPathComponent("text-image.png") as CFURL,
+                                                     UTType.png.identifier as CFString, 1, nil)!
+CGImageDestinationAddImage(textDestination, textBitmap.makeImage()!, nil)
+precondition(CGImageDestinationFinalize(textDestination))
 try Data("Intentionally invalid PDF fixture".utf8).write(to: directory.appendingPathComponent("invalid.pdf"))
 print("Created synthetic PDF and PNG fixtures")

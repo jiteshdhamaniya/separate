@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 — 2026-11-09
+
+- Two-finger double-tap zoom in PDFs and images, toggling back to the previous zoom or Fit mode.
+- Native Live Text selection and copying in images using VisionKit, with asynchronous on-device recognition and status feedback.
+- Regression checks for smart zoom, real text recognition, selection and overlay alignment after zoom.
+
 ## 0.1.1 — 2026-11-09
 
 - Trackpad pinch-to-zoom in PDF and image windows, keeping the content under the pointer stationary where scroll bounds permit.
