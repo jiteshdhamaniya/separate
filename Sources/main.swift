@@ -11,6 +11,13 @@ enum ViewerError: LocalizedError {
 
 // Each open request owns a new window. Never consult the system tab preference.
 final class FileWindow: NSWindow {
+    var onMagnify: ((NSEvent) -> Bool)?
+    override func sendEvent(_ event: NSEvent) {
+        // Route pinch events before PDFKit's nested views can consume them.
+        // Returning early also prevents applying the same zoom twice.
+        if event.type == .magnify, onMagnify?(event) == true { return }
+        super.sendEvent(event)
+    }
     override func mergeAllWindows(_ sender: Any?) {}
     override func toggleTabBar(_ sender: Any?) {}
 }
@@ -91,6 +98,7 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
         window.minSize = NSSize(width: 480, height: 360)
         super.init(window: window)
         window.delegate = self
+        window.onMagnify = { [weak self] event in self?.magnify(with: event) ?? false }
 
         let root = DropSurface(frame: window.contentView!.bounds)
         root.onOpen = { urls in (NSApp.delegate as? AppDelegate)?.openURLs(urls) }
@@ -192,11 +200,55 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
         else { setImageScale(1) }
         updateStatus()
     }
-    func setImageScale(_ scale: CGFloat) {
+    func magnify(with event: NSEvent) -> Bool {
+        guard let content = (imageScroll as NSView?) ?? pdfView,
+              content.bounds.contains(content.convert(event.locationInWindow, from: nil)) else { return false }
+        let delta = event.magnification
+        guard delta.isFinite, delta != 0 else { return true }
+        let factor = max(0.01, 1 + delta)
+        if imageScroll != nil {
+            setImageScale(imageScale * factor, anchorInWindow: event.locationInWindow)
+        } else if let pdfView {
+            // Keep the point on the PDF under the pointer stationary when possible.
+            let point = pdfView.convert(event.locationInWindow, from: nil)
+            let page = pdfView.page(for: point, nearest: true)
+            let pagePoint = page.map { pdfView.convert(point, to: $0) }
+            let clip = pdfView.documentView?.enclosingScrollView?.contentView
+            let oldClipSize = clip?.bounds.size
+            let oldPoint = pdfView.documentView?.convert(event.locationInWindow, from: nil)
+            let offset = oldPoint.flatMap { p in clip.map { NSPoint(x: p.x - $0.bounds.minX, y: p.y - $0.bounds.minY) } }
+            pdfView.autoScales = false
+            pdfView.scaleFactor = min(max(pdfView.scaleFactor * factor, pdfView.minScaleFactor), pdfView.maxScaleFactor)
+            pdfView.layoutDocumentView()
+            if let page, let pagePoint, let clip, let offset, let oldClipSize,
+               oldClipSize.width > 0, oldClipSize.height > 0, let document = pdfView.documentView {
+                let newPoint = document.convert(pdfView.convert(pagePoint, from: page), from: pdfView)
+                // PDFKit also scales the clip view's coordinate system.
+                let adjustedOffset = NSPoint(x: offset.x * clip.bounds.width / oldClipSize.width,
+                                             y: offset.y * clip.bounds.height / oldClipSize.height)
+                scroll(clip, to: NSPoint(x: newPoint.x - adjustedOffset.x, y: newPoint.y - adjustedOffset.y))
+            }
+            updateStatus()
+        }
+        return true
+    }
+    private func scroll(_ clip: NSClipView, to origin: NSPoint) {
+        let proposed = NSRect(origin: origin, size: clip.bounds.size)
+        clip.scroll(to: clip.constrainBoundsRect(proposed).origin)
+        clip.enclosingScrollView?.reflectScrolledClipView(clip)
+    }
+    func setImageScale(_ scale: CGFloat, anchorInWindow: NSPoint? = nil) {
+        guard scale.isFinite, let canvas = imageCanvas, let clip = imageScroll?.contentView else { return }
+        let anchor = anchorInWindow.map { canvas.convert($0, from: nil) }
+            ?? NSPoint(x: clip.bounds.midX, y: clip.bounds.midY)
+        let offset = NSPoint(x: anchor.x - clip.bounds.minX, y: anchor.y - clip.bounds.minY)
+        let previousScale = imageScale
         fitsImage = false
         imageScale = min(max(scale, 0.01), 16)
-        imageCanvas?.setFrameSize(NSSize(width: originalImageSize.width * imageScale, height: originalImageSize.height * imageScale))
-        imageCanvas?.needsDisplay = true
+        canvas.setFrameSize(NSSize(width: originalImageSize.width * imageScale, height: originalImageSize.height * imageScale))
+        let ratio = imageScale / previousScale
+        scroll(clip, to: NSPoint(x: anchor.x * ratio - offset.x, y: anchor.y * ratio - offset.y))
+        canvas.needsDisplay = true
         updateStatus()
     }
     @objc func previousPage(_ sender: Any?) { pdfView?.goToPreviousPage(sender) }
@@ -362,6 +414,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// Synthetic AppKit events exercise the same window dispatch path as a trackpad.
+final class TestMagnifyEvent: NSEvent {
+    var delta: CGFloat = 0
+    var point = NSPoint.zero
+    override var type: NSEvent.EventType { .magnify }
+    override var magnification: CGFloat { delta }
+    override var locationInWindow: NSPoint { point }
+}
+
+func testPinch(_ controller: ViewerController) {
+    let content: NSView = controller.imageScroll ?? controller.pdfView!
+    let event = TestMagnifyEvent()
+    event.point = content.convert(NSPoint(x: content.bounds.midX, y: content.bounds.midY), to: nil)
+    func scale() -> CGFloat { controller.pdfView?.scaleFactor ?? controller.imageScale }
+    func pinch(_ delta: CGFloat) {
+        event.delta = delta
+        controller.window!.sendEvent(event)
+    }
+    controller.fit(nil)
+    pinch(0)
+    precondition(controller.pdfView?.autoScales ?? controller.fitsImage, "Zero-delta events must preserve fit mode")
+    controller.actualSize(nil)
+    pinch(0.25)
+    precondition(abs(scale() - 1.25) < 0.001, "Pinch out must zoom in exactly once")
+    pinch(-0.2)
+    precondition(abs(scale() - 1) < 0.001, "Pinch in must zoom out")
+    precondition(!(controller.pdfView?.autoScales ?? controller.fitsImage))
+    pinch(.nan)
+    precondition(abs(scale() - 1) < 0.001)
+    pinch(1000)
+    precondition(abs(scale() - (controller.pdfView?.maxScaleFactor ?? 16)) < 0.001)
+    pinch(-10)
+    pinch(-10)
+    precondition(abs(scale() - (controller.pdfView?.minScaleFactor ?? 0.01)) < 0.001)
+    event.point = NSPoint(x: -100, y: -100)
+    precondition(!controller.magnify(with: event), "Gestures outside the document must not zoom")
+    event.point = content.convert(NSPoint(x: content.bounds.midX, y: content.bounds.midY), to: nil)
+    controller.fit(nil)
+    precondition(controller.pdfView?.autoScales ?? controller.fitsImage)
+    if let canvas = controller.imageCanvas, let clip = controller.imageScroll?.contentView {
+        controller.setImageScale(4)
+        event.point = canvas.convert(NSPoint(x: clip.bounds.midX + 20, y: clip.bounds.midY + 10), to: nil)
+        let before = canvas.convert(event.point, from: nil)
+        pinch(0.25)
+        let after = canvas.convert(event.point, from: nil)
+        precondition(abs(before.x / 4 - after.x / 5) < 1 && abs(before.y / 4 - after.y / 5) < 1,
+                     "Pinch must keep the image point under the pointer")
+        precondition(controller.status.stringValue.contains("500%"))
+    } else if let pdf = controller.pdfView {
+        controller.actualSize(nil)
+        pinch(3)
+        let point = pdf.convert(event.point, from: nil)
+        let page = pdf.page(for: point, nearest: true)!
+        let before = pdf.convert(point, to: page)
+        pinch(0.25)
+        let after = pdf.convert(pdf.convert(event.point, from: nil), to: page)
+        precondition(abs(before.x - after.x) < 1 && abs(before.y - after.y) < 1,
+                     "Pinch must keep the PDF point under the pointer")
+        precondition(controller.status.stringValue.contains("500%"))
+    }
+}
+
 func selfTest(_ directory: String) throws {
     NSWindow.allowsAutomaticWindowTabbing = false
     let base = URL(fileURLWithPath: directory)
@@ -386,6 +500,7 @@ func selfTest(_ directory: String) throws {
             controller.nextPage(nil)
             precondition(controller.pdfView?.currentPage == controller.pdfView?.document?.page(at: 1))
         }
+        testPinch(controller)
     }
     precondition(Set(controllers.map { ObjectIdentifier($0.window!) }).count == 24)
     precondition(Set(controllers.compactMap { $0.window?.tabbingIdentifier }).count == 24)
@@ -399,7 +514,7 @@ func selfTest(_ directory: String) throws {
         fatalError("Invalid file must fail")
     } catch is ViewerError {}
     controllers.forEach { $0.close() }
-    print("PASS: 24 independent PDF/image windows, tabs disabled, duplicate opens independent, zoom/fit/page navigation, invalid and missing file handling.")
+    print("PASS: 24 independent PDF/image windows, tabs disabled, duplicate opens independent, pinch in/out and limits, zoom anchoring, zoom/fit/page navigation, invalid and missing file handling.")
 }
 
 let application = NSApplication.shared

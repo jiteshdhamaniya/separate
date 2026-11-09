@@ -16,6 +16,7 @@ Separate is for people who want documents in their own windows. Open one file or
 
 - PDF viewing with continuous scrolling, selectable text, page thumbnails and previous/next navigation.
 - Image viewing with zoom, fit and actual size. Common formats are decoded by macOS, including PNG, JPEG, HEIC, TIFF, GIF, BMP and WebP.
+- Trackpad pinch-to-zoom for both PDFs and images, anchored at the pointer. Place the pointer over the document and pinch with two fingers to zoom in or out; use ⌘0 to return to Fit.
 - Open multiple files from Finder, the Open dialog, or by dragging them onto the app icon or welcome window.
 - Native AppKit interface with PDFKit rendering. No web wrapper, account, telemetry or third-party packages.
 - Files are opened for viewing; Separate does not save changes to your originals.
@@ -74,7 +75,7 @@ bash scripts/test.sh
 bash scripts/package.sh
 ```
 
-Tests create their own synthetic PDFs and PNGs, instantiate 24 independent windows without showing them, check the no-tabs policy and repeated file opens, exercise image scaling/PDF navigation, reject invalid and missing files, and confirm the input files are unchanged. AppKit tests require a logged-in macOS graphical session. Packaging produces a universal ZIP and checksum in `dist/`.
+Tests create their own synthetic PDFs and PNGs, instantiate 24 independent windows without showing them, check the no-tabs policy and repeated file opens, exercise image scaling/PDF navigation, dispatch synthetic pinch events through each window (both directions, scale limits, pointer anchoring and returning to Fit), reject invalid and missing files, and confirm the input files are unchanged. AppKit tests require a logged-in macOS graphical session. Packaging produces a universal ZIP and checksum in `dist/`.
 
 The original viewer was also tested interactively by opening 24 mixed PDFs and PNGs from Finder and checking that they remained separate windows.
 

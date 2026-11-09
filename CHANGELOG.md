@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 — 2026-11-09
+
+- Trackpad pinch-to-zoom in PDF and image windows, keeping the content under the pointer stationary where scroll bounds permit.
+- Image toolbar zoom now preserves the viewport center.
+- Regression checks for pinch direction, zoom limits, pointer anchoring and returning to Fit.
+
 ## 0.1.0 — 2026-11-09
 
 First public release.
