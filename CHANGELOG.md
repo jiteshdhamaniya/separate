@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 — 2026-11-15
+
+- Drop PDFs into the thumbnail sidebar to insert or append their pages in order.
+- Insert a blank page or delete selected pages, with undo, redo, Save and Save As.
+
 ## 0.1.3 — 2026-11-15
 
 - Print the active PDF or image with File → Print… or ⌘P using the macOS print dialog.

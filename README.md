@@ -32,7 +32,9 @@ This is a small, opinionated viewer, with a narrower feature set than Preview. I
 - Live Text in images: select recognized text directly on the image and copy it with ⌘C or the context menu. Recognition runs locally using Apple's VisionKit and does not require Apple Intelligence.
 - Open multiple files from Finder, the Open dialog, or by dragging them onto the app icon or welcome window.
 - Native AppKit interface with PDFKit rendering. No web wrapper, account, telemetry or third-party packages.
-- Files are opened for viewing; Separate does not save changes to your originals.
+- Edit PDF pages in the thumbnail sidebar. Drag a PDF from Finder onto the insertion line between thumbnails, or below the last page to append it. Separate copies all its pages in order and leaves the dragged file alone.
+- To insert without dragging, select a thumbnail and choose **Edit → Insert Pages from PDF…** or **Insert Blank Page**. To remove pages, select their thumbnails (⌘-click for multiple) and press **Delete**. At least one page must remain.
+- Undo or redo page edits with **⌘Z / ⇧⌘Z**. Edits stay in the window until you choose **File → Save** (⌘S) or **Save As…** (⇧⌘S) to make a new PDF. Encrypted PDFs are view-only.
 
 ## Build from source
 
@@ -117,7 +119,7 @@ For two-finger double tap, enable **Smart zoom** in macOS System Settings → Tr
 
 ## Current scope
 
-Separate is a viewer. It does not yet provide annotations, signatures, image editing, search, or session restoration. For those tasks, use **Open With → Preview** or another editor. Animated and multipage images use the representation macOS selects; animation playback is not provided. Password-protected PDFs use PDFKit’s password UI.
+Separate supports basic PDF page edits. It does not yet provide annotations, signatures, image editing, search, or session restoration. For those tasks, use **Open With → Preview** or another editor. Animated and multipage images use the representation macOS selects; animation playback is not provided. Password-protected PDFs use PDFKit’s password UI.
 
 The universal build is compiled for both architectures. Interactive testing for this release was performed on Apple Silicon running macOS 26.1; Intel and macOS 13 runtime behavior have not been independently verified.
 
@@ -151,7 +153,7 @@ bash scripts/test.sh
 bash scripts/package.sh
 ```
 
-Tests create their own synthetic PDFs and PNGs, instantiate 24 independent windows without showing them, check the no-tabs policy and repeated file opens, exercise image scaling/PDF navigation, dispatch synthetic pinch and smart-zoom events through each window, recognize and select text in a generated image, reject invalid and missing files, and confirm the input files are unchanged. Live Text checks explicitly report a skip on unsupported devices. AppKit tests require a logged-in macOS graphical session. Packaging produces a universal ZIP and checksum in `dist/`.
+Tests create their own synthetic PDFs and PNGs, instantiate 24 independent windows without showing them, check the no-tabs policy and repeated file opens, exercise image scaling/PDF navigation, dispatch synthetic pinch and smart-zoom events through each window, recognize and select text in a generated image, reject invalid and missing files, test insertion, deletion, undo, saving and the order of reopened pages, and confirm the input fixtures are unchanged. Live Text checks explicitly report a skip on unsupported devices. AppKit tests require a logged-in macOS graphical session. Packaging produces a universal ZIP and checksum in `dist/`.
 
 The original viewer was also tested interactively by opening 24 mixed PDFs and PNGs from Finder and checking that they remained separate windows.
 

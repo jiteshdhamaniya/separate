@@ -24,7 +24,7 @@ final class FileWindow: NSWindow {
 }
 
 final class DropSurface: NSView {
-    var onOpen: (([URL]) -> Void)?
+    var onDrop: (([URL]) -> Bool)?
     override init(frame: NSRect) {
         super.init(frame: frame)
         registerForDraggedTypes([.fileURL])
@@ -35,8 +35,7 @@ final class DropSurface: NSView {
     }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         guard let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty else { return false }
-        onOpen?(urls)
-        return true
+        return onDrop?(urls) == true
     }
 }
 
@@ -108,11 +107,13 @@ final class CenteredClipView: NSClipView {
 }
 
 final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDelegate {
-    let fileURL: URL
+    var fileURL: URL
+    var editor: PageEditor?
+    var savedBytes: Data?
     var pdfView: PDFView?
     var imageScroll: NSScrollView?
     var imageCanvas: ImageCanvas?
-    var thumbnailView: PDFThumbnailView?
+    var thumbnailView: PageSidebar?
     var splitView: NSSplitView?
     var originalImageSize = NSSize.zero
     var imageScale: CGFloat = 1
@@ -128,7 +129,10 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
             throw ViewerError.unreadable(url.lastPathComponent)
         }
         let isPDF = (try? url.resourceValues(forKeys: [.contentTypeKey]).contentType?.conforms(to: .pdf)) == true || url.pathExtension.lowercased() == "pdf"
-        let pdf = isPDF ? PDFDocument(url: url) : nil
+        let bytes = isPDF ? try Data(contentsOf: url) : nil
+        let pdf = bytes.flatMap(PDFDocument.init(data:))
+        savedBytes = bytes
+        editor = pdf.map(PageEditor.init)
         let image = isPDF ? nil : NSImage(contentsOf: url)
         guard (pdf?.pageCount ?? 0) > 0 || pdf?.isLocked == true || (image?.isValid == true) else {
             throw ViewerError.unreadable(url.lastPathComponent)
@@ -150,7 +154,15 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
         }
 
         let root = DropSurface(frame: window.contentView!.bounds)
-        root.onOpen = { urls in (NSApp.delegate as? AppDelegate)?.openURLs(urls) }
+        root.onDrop = { [weak self] urls in
+            guard let self else { return false }
+            if let editor = self.editor, urls.allSatisfy(PageSidebar.isPDF) {
+                if !editor.editable { self.reportEditError(PageEditError("This PDF does not allow page edits.")); return false }
+                return self.importPDFs(urls, at: editor.document.pageCount)
+            }
+            (NSApp.delegate as? AppDelegate)?.openURLs(urls)
+            return true
+        }
         window.contentView = root
         let content: NSView
         if let pdf {
@@ -163,9 +175,7 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
             view.minScaleFactor = 0.1
             view.maxScaleFactor = 8
             pdfView = view
-            let thumbnails = PDFThumbnailView()
-            thumbnails.pdfView = view
-            thumbnails.thumbnailSize = NSSize(width: 88, height: 120)
+            let thumbnails = PageSidebar(viewer: self)
             thumbnailView = thumbnails
             let split = NSSplitView()
             split.isVertical = true
@@ -175,7 +185,10 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
             splitView = split
             content = split
             for name in [Notification.Name.PDFViewPageChanged, .PDFViewScaleChanged, .PDFDocumentDidUnlock] {
-                observations.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.updateStatus() })
+                observations.append(NotificationCenter.default.addObserver(forName: name, object: name == .PDFDocumentDidUnlock ? pdf as AnyObject : view, queue: .main) { [weak self] _ in
+                    if name == .PDFDocumentDidUnlock { self?.thumbnailView?.table.reloadData() }
+                    self?.updateStatus()
+                })
             }
         } else if let image {
             let representation = image.representations.max { $0.pixelsWide < $1.pixelsWide }
@@ -369,12 +382,18 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
         thumbnails.isHidden.toggle()
         split.adjustSubviews()
         if !thumbnails.isHidden { split.setPosition(124, ofDividerAt: 0) }
+        updateStatus()
     }
     func updateStatus() {
         if let pdfView, let document = pdfView.document {
             if document.isLocked { status.stringValue = "Password-protected PDF"; return }
-            let page = pdfView.currentPage.map { document.index(for: $0) + 1 } ?? 1
+            let index = pdfView.currentPage.map { document.index(for: $0) } ?? 0
+            let page = index < document.pageCount ? index + 1 : 1
+            if let sidebar = thumbnailView, !sidebar.table.selectedRowIndexes.contains(page - 1) { sidebar.select(page - 1) }
             status.stringValue = "Page \(page) of \(document.pageCount)  ·  \(Int(pdfView.scaleFactor * 100))%"
+            if editor?.editable == true && thumbnailView?.isHidden == false {
+                status.stringValue += "  ·  Drop PDFs in the sidebar to insert pages"
+            }
         } else {
             status.stringValue = "\(Int(originalImageSize.width)) × \(Int(originalImageSize.height)) pixels  ·  \(Int(imageScale * 100))%"
             if let textStatus = imageCanvas?.textStatus, !textStatus.isEmpty { status.stringValue += "  ·  " + textStatus }
@@ -418,6 +437,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         makeMenu()
         if viewers.isEmpty { showWelcome() }
         NSApp.activate(ignoringOtherApps: true)
+    }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        viewers.values.allSatisfy { $0.confirmClose() } ? .terminateNow : .terminateCancel
     }
     func application(_ application: NSApplication, open urls: [URL]) { openURLs(urls) }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -464,7 +486,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.isReleasedWhenClosed = false
         window.center()
         let root = DropSurface(frame: window.contentView!.bounds)
-        root.onOpen = { [weak self] urls in self?.openURLs(urls) }
+        root.onDrop = { [weak self] urls in self?.openURLs(urls); return true }
         window.contentView = root
         let iconImage = NSImage(named: "AppIcon") ?? NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "Separate windows")!
         let icon = NSImageView(image: iconImage)
@@ -506,9 +528,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let file = submenu("File")
         let open = file.addItem(withTitle: "Open…", action: #selector(openPanel(_:)), keyEquivalent: "o")
         open.target = self
+        file.addItem(withTitle: "Save", action: #selector(ViewerController.savePages(_:)), keyEquivalent: "s")
+        file.addItem(withTitle: "Save As…", action: #selector(ViewerController.savePagesAs(_:)), keyEquivalent: "S")
         file.addItem(withTitle: "Print…", action: #selector(ViewerController.printFile(_:)), keyEquivalent: "p")
         file.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         let edit = submenu("Edit")
+        edit.addItem(withTitle: "Undo Page Edit", action: #selector(ViewerController.undoPages(_:)), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo Page Edit", action: #selector(ViewerController.redoPages(_:)), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Insert Pages from PDF…", action: #selector(ViewerController.insertPDF(_:)), keyEquivalent: "")
+        edit.addItem(withTitle: "Insert Blank Page", action: #selector(ViewerController.addBlankPage(_:)), keyEquivalent: "")
+        edit.addItem(withTitle: "Delete Selected Pages", action: #selector(ViewerController.deletePages(_:)), keyEquivalent: "")
+        edit.addItem(.separator())
         edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         let view = submenu("View")
@@ -700,6 +731,7 @@ func testSmartZoom(_ controller: ViewerController) {
         fatalError("Invalid file must fail")
     } catch is ViewerError {}
     controllers.forEach { $0.close() }
+    try testPageEdits(base)
     try testPrinting(base)
     try testLiveText(base)
     print("PASS: 24 independent PDF/image windows, tabs disabled, duplicate opens independent, pinch in/out and limits, zoom anchoring, zoom/fit/page navigation, invalid and missing file handling.")

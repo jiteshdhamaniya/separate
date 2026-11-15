@@ -31,6 +31,11 @@ for index in 1...2 {
         pdf.fill(CGRect(x: 40, y: 60, width: 320, height: 380))
         pdf.setFillColor(CGColor(gray: 1, alpha: 1))
         pdf.fill(CGRect(x: 70, y: 100, width: 260, height: 36))
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: "File \(index) page \(number)", attributes: [
+            NSAttributedString.Key(kCTFontAttributeName as String): CTFontCreateWithName("Helvetica" as CFString, 16, nil)
+        ]))
+        pdf.textPosition = CGPoint(x: 78, y: 110)
+        CTLineDraw(line, pdf)
         pdf.endPDFPage()
     }
     pdf.closePDF()
