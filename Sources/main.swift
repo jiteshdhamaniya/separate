@@ -224,6 +224,36 @@ final class ViewerController: NSWindowController, NSWindowDelegate, NSToolbarDel
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     deinit { observations.forEach(NotificationCenter.default.removeObserver) }
 
+    // Print the document, independent of viewport, selection and display zoom.
+    func makePrintOperation(info: NSPrintInfo) -> NSPrintOperation? {
+        let document: PDFDocument
+        if let pdf = pdfView?.document {
+            guard !pdf.isLocked, pdf.allowsPrinting else { return nil }
+            document = pdf
+        } else if let image = imageCanvas?.image, let page = PDFPage(image: image) {
+            document = PDFDocument()
+            document.insert(page, at: 0)
+        } else { return nil }
+        let operation = document.printOperation(for: info, scalingMode: .pageScaleDownToFit, autoRotate: true)
+        operation?.jobTitle = fileURL.lastPathComponent
+        return operation
+    }
+
+    @objc func printFile(_ sender: Any?) {
+        guard let window else { return }
+        guard let operation = makePrintOperation(info: NSPrintInfo.shared.copy() as! NSPrintInfo) else {
+            let alert = NSAlert()
+            alert.messageText = "This file can’t be printed."
+            if let pdf = pdfView?.document {
+                alert.informativeText = pdf.isLocked ? "Unlock the PDF first." :
+                    (!pdf.allowsPrinting ? "The PDF does not allow printing." : "The print preview could not be prepared.")
+            }
+            alert.beginSheetModal(for: window)
+            return
+        }
+        operation.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
+    }
+
     func windowWillClose(_ notification: Notification) { imageCanvas?.cancelAnalysis(); onClose?() }
     func windowDidResize(_ notification: Notification) { if fitsImage { fit(nil) } }
 
@@ -476,6 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let file = submenu("File")
         let open = file.addItem(withTitle: "Open…", action: #selector(openPanel(_:)), keyEquivalent: "o")
         open.target = self
+        file.addItem(withTitle: "Print…", action: #selector(ViewerController.printFile(_:)), keyEquivalent: "p")
         file.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         let edit = submenu("Edit")
         edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
@@ -611,6 +642,25 @@ func testSmartZoom(_ controller: ViewerController) {
     print("PASS: Live Text recognition, selectable text and overlay zoom geometry")
 }
 
+// Exercise the native print pipeline without sending anything to a printer.
+@MainActor func testPrinting(_ base: URL) throws {
+    for (name, pages) in [("window-one.pdf", 2), ("image-one.png", 1)] {
+        let controller = try ViewerController(url: base.appendingPathComponent(name), analyzeImages: false)
+        defer { controller.close() }
+        controller.zoomIn(nil)
+        let output = base.appendingPathComponent("printed-" + name + ".pdf")
+        let info = NSPrintInfo.shared.copy() as! NSPrintInfo
+        info.jobDisposition = .save
+        info.dictionary()[NSPrintInfo.AttributeKey.jobSavingURL] = output
+        guard let operation = controller.makePrintOperation(info: info) else { fatalError("Print operation missing") }
+        operation.showsPrintPanel = false
+        operation.showsProgressPanel = false
+        precondition(operation.run(), "Print to PDF failed")
+        precondition(PDFDocument(url: output)?.pageCount == pages, "Incorrect printed page count")
+    }
+    print("PASS: native print-to-PDF for a two-page PDF and a one-page image")
+}
+
 @MainActor func selfTest(_ directory: String) throws {
     NSWindow.allowsAutomaticWindowTabbing = false
     let base = URL(fileURLWithPath: directory)
@@ -650,6 +700,7 @@ func testSmartZoom(_ controller: ViewerController) {
         fatalError("Invalid file must fail")
     } catch is ViewerError {}
     controllers.forEach { $0.close() }
+    try testPrinting(base)
     try testLiveText(base)
     print("PASS: 24 independent PDF/image windows, tabs disabled, duplicate opens independent, pinch in/out and limits, zoom anchoring, zoom/fit/page navigation, invalid and missing file handling.")
 }

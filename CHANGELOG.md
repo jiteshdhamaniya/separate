@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3 — 2026-11-15
+
+- Print the active PDF or image with File → Print… or ⌘P using the macOS print dialog.
+
 ## 0.1.2 — 2026-11-09
 
 - Two-finger double-tap zoom in PDFs and images, toggling back to the previous zoom or Fit mode.

@@ -23,6 +23,8 @@ This is a small, opinionated viewer, with a narrower feature set than Preview. I
 
 ## Features
 
+- Print the active PDF or image with **File → Print…** (⌘P). Choose a printer, a page range for PDFs, or **PDF → Save as PDF** in the macOS print dialog.
+
 - PDF viewing with continuous scrolling, selectable text, page thumbnails and previous/next navigation.
 - Image viewing with zoom, fit and actual size. Common formats are decoded by macOS, including PNG, JPEG, HEIC, TIFF, GIF, BMP and WebP.
 - Trackpad pinch-to-zoom for both PDFs and images, anchored at the pointer. Place the pointer over the document and pinch with two fingers to zoom in or out; use ⌘0 to return to Fit.
@@ -103,6 +105,7 @@ In Finder, select a PDF or image → **Get Info** → **Open with: Separate** �
 | Action | Shortcut |
 | --- | --- |
 | Open files | ⌘O |
+| Print the current file | ⌘P |
 | Close the current window | ⌘W |
 | Fit to window | ⌘0 |
 | Actual size | ⌘1 |
@@ -114,7 +117,7 @@ For two-finger double tap, enable **Smart zoom** in macOS System Settings → Tr
 
 ## Current scope
 
-Separate is a viewer. It does not yet provide annotations, signatures, image editing, printing/export, search, or session restoration. For those tasks, use **Open With → Preview** or another editor. Animated and multipage images use the representation macOS selects; animation playback is not provided. Password-protected PDFs use PDFKit’s password UI.
+Separate is a viewer. It does not yet provide annotations, signatures, image editing, search, or session restoration. For those tasks, use **Open With → Preview** or another editor. Animated and multipage images use the representation macOS selects; animation playback is not provided. Password-protected PDFs use PDFKit’s password UI.
 
 The universal build is compiled for both architectures. Interactive testing for this release was performed on Apple Silicon running macOS 26.1; Intel and macOS 13 runtime behavior have not been independently verified.
 
